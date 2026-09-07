@@ -1,0 +1,18 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# datasets — download these, never commit them
+data_pipeline/data/
+*.tgz
+*.tar.gz
+
+# generated training artifacts: regenerate with scripts/run_pipeline.py
+data_pipeline/outputs/artifacts/*.jsonl
+
+# the build-it-yourself course lives here; not part of this repo yet
+autovla_scratch/
+
+.DS_Store

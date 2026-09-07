@@ -1,0 +1,25 @@
+==================================================================
+AutoVLA data pipeline — Phase I report
+==================================================================
+
+Motion segments (0.5 s)        : 96,000
+  mean speed                   : 5.62 m/s
+  95th pct speed               : 14.64 m/s
+  stationary fraction          : 21.4%
+
+Action codebook                : K = 2048
+  covering radius              : 0.0629 m
+  clustering mode              : fps
+  pool size                    : 96,000
+
+Tokenizer reconstruction (5 s, 1,500 trajectories)
+  ADE                          : 0.0240 m
+  FDE                          : 0.0254 m
+  heading MAE                  : 0.415 deg
+  codebook usage               : 58.2%
+
+Training samples               : 24,000
+  thinking modes               : {'fast': 17660, 'slow': 6340}
+  commands                     : {'Stop': 4201, 'Go Straight': 14830, 'Turn Left': 2399, 'Turn Right': 2570}
+  mean |velocity|              : 5.16 m/s
+==================================================================

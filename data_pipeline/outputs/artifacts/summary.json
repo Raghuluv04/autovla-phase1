@@ -1,0 +1,36 @@
+{
+  "source": "synthetic",
+  "n_trajectories": 4000,
+  "n_samples": 24000,
+  "n_segments": 96000,
+  "codebook_size": 2048,
+  "covering_radius": 0.06290308544033422,
+  "feasibility": {
+    "n": 2048,
+    "feasible_frac": 0.99853515625,
+    "max_abs_curvature": 0.17335338905194553,
+    "max_abs_steer_deg": 24.16284396954597,
+    "speed_range": [
+      0.0,
+      25.000194448675604
+    ],
+    "accel_range": [
+      0.0,
+      0.7681522921356816
+    ]
+  },
+  "tokenizer": {
+    "ade": 0.023960886591691974,
+    "fde": 0.025403146297220413,
+    "heading_mae_deg": 0.41452700021262595,
+    "codebook_usage": 0.58154296875,
+    "n_traj": 1500
+  },
+  "sft": {
+    "fast": 17660,
+    "slow": 6340,
+    "dropped": 0,
+    "ade": 0.023842304878477664
+  },
+  "runtime_s": 45.7
+}

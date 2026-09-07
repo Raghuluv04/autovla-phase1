@@ -1,0 +1,559 @@
+# Dataset and Method — AutoVLA Data Pipeline (Phase I)
+
+**Team 5** · Raghul D (23BAI0034), Sahithya D (23BAI0035), Medha S (23BAI0039)
+**Course** BCSE332L Deep Learning · Phase I Course Based Design Project
+**Base paper** Zhou et al., *AutoVLA: A Vision-Language-Action Model for End-to-End
+Autonomous Driving with Adaptive Reasoning and Reinforcement Fine-Tuning*,
+arXiv:2506.13757 (2025) · <https://autovla.github.io/>
+
+This document explains, in detail, **what data the project uses**, **what we built**,
+and **how each stage works**. It covers Phase I only: the data-processing and
+visualisation layer. The model, training and reinforcement-learning stages are
+described in [MILESTONES.md](../MILESTONES.md).
+
+---
+
+## 1. What problem the data pipeline solves
+
+End-to-end driving models normally predict a trajectory with a regression head:
+the network outputs a list of `(x, y)` waypoints directly. This has two known
+failure modes — the output can be **physically impossible** for a car to drive
+(a sideways jump, an impossible turn radius), and it **cannot share a
+representation with language**, so a model that both explains and drives needs
+two separate heads glued together.
+
+AutoVLA's central idea removes both problems at once. Instead of regressing
+waypoints, it builds a **fixed vocabulary of 2048 short driving manoeuvres**
+harvested from real driving logs, and predicts a *sequence of vocabulary indices*.
+Because every entry in the vocabulary is a motion a real vehicle actually
+performed, any sequence of them is drivable by construction. And because they are
+just tokens, a language model can emit them in the same output stream as its
+reasoning text:
+
+```
+"This scenario requires careful reasoning.
+ Scene: four-way intersection, wet road, green light...
+ Driving decision: yield to the crossing pedestrian, then proceed.
+ <action_412><action_87><action_87><action_1203>...<action_66>"
+```
+
+Ten tokens, half a second each, decode back into a five-second trajectory.
+**Building that vocabulary, and the encoder/decoder around it, is what this
+pipeline does.**
+
+---
+
+## 2. The datasets
+
+### 2.1 What the base paper used
+
+AutoVLA trains on four sources, standardised into one format:
+
+| Dataset | Role in the paper | Size used |
+|---|---|---|
+| **nuPlan / NAVSIM** | Main open-loop planning benchmark; PDMS metric | 166.3k train, 12.1k test |
+| **nuScenes** | Secondary benchmark; L2 + collision rate | 19.0k train, 5.6k test |
+| **Waymo E2E** | Long-tail / difficult scenes; Rater Feedback Score | 23.8k train, 1.5k test |
+| **CARLA (CARLA-Garage)** | Closed-loop simulation testing | 274.5k train |
+| **WOMD** | *Source of the action codebook only* | motion segments |
+
+An important detail: the **action codebook is not built from the training set**.
+It is clustered from the Waymo Open Motion Dataset, which is a large corpus of
+raw vehicle trajectories, and then reused unchanged across nuPlan, nuScenes and
+Waymo. A separate codebook is built for CARLA because simulated vehicle dynamics
+differ from real ones.
+
+### 2.2 What our project targets
+
+Our proposal names five datasets, each tied to a specific objective:
+
+| Dataset | Why we need it | Objective | Size |
+|---|---|---|---|
+| **nuScenes** | 1000 urban driving scenes, 6 cameras + LiDAR + radar, 3D boxes, 2 Hz keyframes. Primary perception and open-loop planning benchmark. | 1, 2 | 300+ GB full; **4 GB mini** |
+| **BDD-X** | Driving videos paired with a human *description* and *justification* of what the driver did. The benchmark for explanation quality (BLEU-4, METEOR, CIDEr). | 3 | ~5 MB (annotations) |
+| **DriveLM / Reason2Drive** | Graph-structured perception→prediction→reasoning QA built on nuScenes. Source of chain-of-thought supervision. | 3, 5 | ~1 GB |
+| **NAVSIM (nuPlan)** | Non-reactive closed-loop benchmark reporting PDMS, including safety-critical splits. | 6 | large |
+| **CARLA 0.9.x** | Closed-loop RL fine-tuning and adverse-weather generalisation. | 6 | simulator |
+
+**nuScenes mini is the practical target for this phase.** It is 10 full scenes,
+~4 GB, free with an account, and contains everything the pipeline needs: ego
+poses, camera images, calibration, and 2 Hz keyframes. The dev machine has ~29 GB
+free, so mini fits and full trainval does not.
+
+### 2.3 What we actually ran on, and why
+
+> **Stated plainly: the results in this repository were produced from a
+> procedurally generated corpus, not from nuScenes.** nuScenes requires accepting
+> a licence and signing in, so the 4 GB archive could not be fetched
+> automatically. The nuScenes reader is written, tested for import, and waiting
+> on the download.
+
+To avoid blocking all of Phase I on that download, we wrote a **procedural
+trajectory corpus** (`autovla/adapters/synthetic.py`) that produces kinematically
+valid ego trajectories. It exists so the codebook, tokenizer, statistics and
+figures could be built, debugged and measured immediately.
+
+**What it is:** trajectories generated by integrating a kinematic bicycle model
+under sampled manoeuvre profiles.
+
+**What it is not:** a model of driving *behaviour*. It has no roads, no other
+agents, no traffic rules. No claim in this report depends on its realism, and
+every number produced from it is labelled as such.
+
+The manoeuvre mix is weighted to resemble urban driving:
+
+| Manoeuvre | Share | Initial speed |
+|---|---|---|
+| Cruise | 30% | 0–16 m/s |
+| Stop-and-go | 16% | 1–14 m/s |
+| Decelerate | 12% | 1–14 m/s |
+| Accelerate | 12% | 0–4 m/s |
+| Left turn | 8% | 2–8 m/s |
+| Right turn | 8% | 2–8 m/s |
+| Lane change | 7% | 1–14 m/s |
+| Curve following | 7% | 1–14 m/s |
+
+plus a 10% chance that any trajectory is fully **stationary** (queued at a light),
+because real urban logs contain a large block of zero-motion frames and a codebook
+that ignores them is wrong.
+
+Two details we corrected during development, both of which matter:
+
+1. **Control noise is temporally correlated, not white.** White noise on steering
+   implies infinite steering rate — physically meaningless, and it makes every
+   segment unique, which inflates quantization error artificially. We low-pass the
+   noise over ~1.2 s.
+2. **Lane changes are speed-scaled.** For a sinusoidal steering input of amplitude
+   *A* over duration *T* at speed *v*, the lateral offset integrates to
+   `y ≈ A·v²·T² / (2πL)`. A fixed amplitude therefore produces a 0.3 m twitch at
+   low speed and a 10 m swerve at high speed. We invert that relation so every
+   lane change is one lane width (~3.5 m) regardless of speed.
+
+Resulting corpus statistics: **mean speed 5.6 m/s, 21% of frames stationary** —
+in the right range for urban driving.
+
+### 2.4 Getting the real data
+
+```bash
+bash scripts/download_nuscenes.sh ~/Downloads/v1.0-mini.tgz
+```
+
+```bash
+./.venv/bin/python scripts/run_pipeline.py --source nuscenes
+```
+
+Download `v1.0-mini.tgz` from <https://www.nuscenes.org/nuscenes#download>
+(free account, accept the terms). BDD-X annotations need no account:
+
+```bash
+bash scripts/download_bddx.sh
+```
+
+---
+
+## 3. The unified sample schema
+
+The paper standardises every dataset into one record before training
+(Appendix E.1). We implement that record as `DrivingSample` in
+`autovla/schema.py`, and every adapter emits it — so nothing downstream of the
+adapter knows or cares which dataset it came from.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sample_id` | str | Unique key (nuScenes sample token, or synthetic id) |
+| `dataset` | str | Provenance tag |
+| `future_traj` | `(11, 3)` | Ground-truth future, **ego frame**, 2 Hz, 5 s. Row 0 is `(0,0,0)` by construction |
+| `history_traj` | `(4, 3)` | Previous 2 s, ego frame, ending at the current pose |
+| `images` | dict | `{camera: [path_t-3, path_t-2, path_t-1, path_t]}` for 3 cameras |
+| `velocity` | float | Current speed, m/s |
+| `acceleration` | float | Current longitudinal acceleration, m/s² |
+| `command` | str | High-level instruction: Go Straight / Turn Left / Turn Right / Stop |
+| `reasoning` | Reasoning | Four-part chain of thought (empty ⇒ "fast thinking" sample) |
+
+The `Reasoning` object has exactly the four fields the paper's annotation
+pipeline produces: **scene description**, **critical objects**, **agent
+intentions**, **driving decision**.
+
+**Poses are `(x, y, θ)`**, x forward, y left, θ yaw in radians — a rigid pose in
+SE(2). Everything is expressed relative to the ego vehicle at the current
+timestep, which is what makes samples from different datasets, cities and
+timestamps directly comparable.
+
+### How the command is derived
+
+nuScenes does not ship a navigation instruction per frame, so — following standard
+practice in UniAD, VAD and AutoVLA's own preprocessing — we read it off the future
+path: net lateral displacement > 4 m ⇒ turn, total travel < 1 m ⇒ stop, otherwise
+go straight.
+
+---
+
+## 4. The pipeline, stage by stage
+
+```
+raw logs
+  │  adapters/{nuscenes,synthetic}.py
+  ▼
+unified DrivingSamples ─────────────────────┐
+  │  stats.segment_bank()                   │
+  ▼                                         │
+0.5 s motion segments (Δx, Δy, Δθ)          │
+  │  codebook.build_codebook()              │
+  ▼                                         │
+K-disk action codebook (K = 2048)           │
+  │  tokenizer.ActionTokenizer              │
+  ▼                                         ▼
+action token ids ──────────► build_dataset.build_sft_records()
+                                            │
+                                            ▼
+                              SFT chat records + action vocabulary
+```
+
+### Stage 1 — Read the logs
+
+**nuScenes** (`adapters/nuscenes.py`). We parse the JSON tables directly rather
+than installing `nuscenes-devkit`, which keeps the pipeline installable on any
+Python version. We read `scene`, `sample`, `sample_data`, `ego_pose`, `sensor`
+and `calibrated_sensor`, then:
+
+- walk each scene through its `first_sample_token` / `next` links to get keyframes in order;
+- take the ego pose attached to each keyframe's `CAM_FRONT` record;
+- convert the stored `(w, x, y, z)` quaternion to a yaw angle;
+- keep the camera intrinsics and extrinsics for projection.
+
+**Synthetic** (`adapters/synthetic.py`). Integrate the bicycle model at 100 Hz for
+12 s, then downsample to 2 Hz — giving 25 poses per trajectory. We generate 4000
+of them.
+
+### Stage 2 — Build unified samples
+
+For each keyframe *i* with enough history and future, we transform the
+surrounding poses into the ego frame at *i*:
+
+```
+relative(A, B) = ( cos θ_A·Δx + sin θ_A·Δy,
+                  −sin θ_A·Δx + cos θ_A·Δy,
+                   wrap(θ_B − θ_A) )        where Δ = B − A
+```
+
+- **future** = next 10 keyframes → an `(11, 3)` array, 5 s at 2 Hz;
+- **history** = previous 3 keyframes plus the current one → `(4, 3)`, 2 s;
+- **velocity** = ‖position difference‖ / 0.5 s;
+- **acceleration** = change in that speed / 0.5 s;
+- **images** = the 4-frame path sequence for `CAM_FRONT_LEFT`, `CAM_FRONT`, `CAM_FRONT_RIGHT`.
+
+With a stride of 2 over 25-pose trajectories this yields **6 samples per
+trajectory → 24,000 samples**.
+
+### Stage 3 — Cut the segment bank
+
+Every trajectory is differenced into consecutive body-frame motion segments:
+
+```
+δ_t = relative(pose_t, pose_{t+1})   →   (Δx, Δy, Δθ) covering 0.5 s
+```
+
+25 poses give 24 segments, so 4000 trajectories give **96,000 segments**. This is
+the pool that clustering runs over. Note this is deliberately a *different*
+sampling of the data than the training samples — the codebook wants coverage of
+motion primitives, not balanced scenarios.
+
+### Stage 4 — K-disk clustering → the action codebook
+
+This is the core of the method (paper Appendix A).
+
+**Why contours, not points.** Two motion segments could end at nearly the same
+`(x, y)` while pointing in very different directions — identical as points, very
+different as vehicle states. So each segment is represented by **the vehicle's
+footprint at the end of the segment**: we take the ego bounding box (nuScenes ego
+platform, 4.084 m × 1.730 m, origin at the rear axle) and sample 16 points evenly
+along its perimeter. Distance between two segments is then the average distance
+between corresponding contour points — a metric that is sensitive to position
+*and* heading in the correct proportion. Concretely, a 1 m forward offset scores
+1.00 m; a 5° heading change scores 0.16 m.
+
+**Implementation note.** We flatten the 16 contour points into a 32-vector scaled
+by `1/√16`, so plain Euclidean distance in that space equals the *root-mean-square*
+per-point distance rather than the arithmetic mean. This lets the whole clustering
+run as vectorised NumPy. We measured the difference: the RMS/mean ratio has a
+median of **1.002** and a maximum of **1.16** over the codebook, so the two induce
+the same clustering.
+
+**The selection.** K-disk picks a set of representative segments such that no two
+are within δ = 0.05 m of each other. We implement two variants:
+
+- **`fps` (default)** — farthest-point sampling: repeatedly take the candidate
+  furthest from everything already chosen. This produces *exactly* K tokens and
+  reports the achieved covering radius (the largest distance from any segment in
+  the pool to its nearest token), which is the number directly comparable to the
+  paper's δ.
+- **`threshold`** — the literal reading: shuffle the pool and accept any candidate
+  at least δ from everything chosen. Follows data density more closely but gives
+  no control over the final K.
+
+Token 0 is seeded as the most stationary segment in the pool, so "hold still"
+always exists.
+
+For each selected segment we store its `(Δx, Δy, Δθ)`. That triple *is* the action
+token. **Achieved covering radius: 0.063 m** against the paper's stated 0.05 m.
+
+**Feasibility check.** The paper argues these tokens are physical because they
+came from real logs. We verify that claim rather than assuming it
+(`kinematics.py`), by inverting each token into the controls that would produce
+it. Fitting a constant-curvature arc over the segment:
+
+```
+arc length  s = chord · (Δθ/2) / sin(Δθ/2)
+curvature   κ = Δθ / s
+steering    δ = arctan(κ · L)          L = 2.588 m wheelbase
+mean speed  v = s / 0.5 s
+```
+
+**99.9% of the 2048 tokens fall inside the vehicle limits**, with a maximum
+demanded steering angle of 24.2°. This is Objective 4's dynamics check.
+
+### Stage 5 — The action tokenizer
+
+**Decoding** is a chain of rigid-body compositions. Starting from the current
+pose, apply each token's motion in the frame reached so far:
+
+```
+pose_{t+1} = compose(pose_t, a_t)
+           = ( x_t + cos θ_t·Δx − sin θ_t·Δy,
+               y_t + sin θ_t·Δx + cos θ_t·Δy,
+               wrap(θ_t + Δθ) )
+```
+
+Ten tokens → an 11-pose, 5-second trajectory.
+
+**Encoding** splits the ground-truth trajectory into 0.5 s segments and maps each
+to its nearest codebook entry under contour distance. *How* those segments are
+measured turns out to be the single most consequential decision in the whole
+pipeline, and the paper does not specify it — see §6.
+
+### Stage 6 — Build the training records
+
+Each sample becomes a chat record:
+
+- **system** — the role, the task, the two thinking modes, and the required
+  four-step reasoning format. (The paper renders its exact prompt as an image, so
+  ours is a reconstruction following the structure it describes.)
+- **user** — camera observations, ego speed and acceleration, navigation
+  instruction, and the request to plan 5 seconds.
+- **assistant** — either the short *fast thinking* template or the four-step
+  chain of thought, followed by exactly ten `<action_i>` tokens.
+
+We also write `action_vocab.json`, the 2048 special tokens that get added to the
+Qwen2.5-VL tokenizer in Milestone 4.
+
+**Output: 24,000 records — 17,660 fast-thinking, 6,340 slow-thinking (26%).** We
+verified programmatically that all 24,000 contain exactly ten parseable action
+tokens.
+
+> The chain-of-thought text is currently a **placeholder**. Real reasoning
+> annotations come from Milestone 5 (DriveLM QA reformatted into the four-field
+> shape, plus BDD-X for the explanation benchmark). The *plumbing* — the fast/slow
+> split, the weighting, the response format — is complete and exercised.
+
+---
+
+## 5. Metrics
+
+| Metric | Definition |
+|---|---|
+| **ADE** | Average Displacement Error — mean L2 distance between decoded and ground-truth waypoints over the 5 s horizon |
+| **FDE** | Final Displacement Error — L2 distance at the last waypoint |
+| **Heading MAE** | Mean absolute yaw error, degrees |
+| **Covering radius** | Largest contour distance from any segment in the pool to its nearest codebook token. Directly comparable to the paper's δ |
+| **Codebook usage (CU)** | Fraction of the 2048 tokens that appear at least once when encoding the evaluation set |
+| **Feasibility** | Fraction of tokens whose inverted controls satisfy curvature, steering, acceleration and speed limits |
+
+ADE and FDE here measure **reconstruction**, not prediction: how much information
+the tokenization itself destroys. It is an upper bound on how well any model
+using this vocabulary could ever do.
+
+---
+
+## 6. Results
+
+### 6.1 Against the paper's Table 4
+
+| K | our ADE | paper ADE | our FDE | paper FDE | our CU |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 12.20 cm | — | 13.79 cm | — | 97.7% |
+| 256 | 8.42 cm | 6.87 cm | 9.48 cm | 10.34 cm | 90.2% |
+| 512 | 5.52 cm | — | 6.24 cm | — | 81.8% |
+| 1024 | 3.67 cm | 2.53 cm | 3.96 cm | 2.82 cm | 70.4% |
+| **2048** | **2.40 cm** | **1.82 cm** | **2.54 cm** | **2.03 cm** | 58.2% |
+| 4096 | 1.58 cm | 1.41 cm | 1.70 cm | 1.55 cm | 44.9% |
+
+Same order of magnitude and the same curve shape at every size. Plus:
+
+- **covering radius 0.063 m** vs the paper's stated δ = 0.05 m;
+- **99.9% of tokens physically feasible**;
+- heading MAE **0.41°**;
+- full pipeline runtime **86 s** on an M4 Mac, CPU only.
+
+**Why we do not match exactly.** Our numbers come from the procedural corpus; the
+paper clusters the Waymo Open Motion Dataset. Real driving logs are far denser and
+more stereotyped, and a nearest-neighbour codebook is rewarded precisely by that
+redundancy. Our corpus samples manoeuvre parameters continuously across a wide
+speed range, so its segments are more spread out and harder to cover with 2048
+representatives. The gap is a property of the data source, not of the method — and
+it is the reason the codebook usage figure (58.2% vs the paper's 100%) is low.
+
+### 6.2 The finding: where the paper is silent
+
+The paper states only that each 0.5 s segment is mapped *"to its nearest action
+token"*. **It never says which pose the segment is measured from**, and the two
+readings differ by 6×.
+
+- **Open-loop anchoring** — measure segment *t* relative to the *ground-truth*
+  pose at *t*. Each token is individually the best match, but decoding composes
+  them from the start, so a heading quantization error at step *t* rotates every
+  later waypoint. Error compounds: **14.67 cm ADE, 31.7 cm FDE** at K = 2048.
+- **Anchored (our default)** — measure segment *t* relative to the pose the
+  decoder has *actually reached*. Each token corrects the drift left by its
+  predecessors: **2.40 cm ADE, 2.54 cm FDE**.
+
+We diagnosed this by measuring the per-segment error separately from the composed
+error: per-segment position error is only **1.94 cm**, but open-loop composition
+produces a **31 cm** final error — five times the **6.1 cm** a random walk of
+independent 1.94 cm errors would give. That excess is the compounding signature.
+
+The paper reports FDE (2.03 cm) roughly *equal* to ADE (1.82 cm). Under open-loop
+anchoring FDE is always several times ADE. **So AutoVLA is almost certainly using
+the anchored scheme**, and the naive reading of that one sentence costs a sixfold
+accuracy loss. Both are implemented:
+`tokenizer.encode(traj, mode="anchored" | "open_loop")`.
+
+---
+
+## 7. How to run it
+
+```bash
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+```
+
+```bash
+./.venv/bin/python scripts/run_pipeline.py --n-traj 4000 --ablation
+```
+
+No GPU, no dataset download, ~90 seconds. Useful flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--source` | `synthetic` | `synthetic` or `nuscenes` |
+| `--n-traj` | 4000 | Trajectories in the procedural corpus |
+| `--codebook-size` | 2048 | K |
+| `--mode` | `fps` | `fps` or `threshold` K-disk selection |
+| `--max-segments` | 120000 | Cap on the clustering pool |
+| `--eval-traj` | 2000 | Trajectories used for reconstruction metrics |
+| `--ablation` | off | Sweep K ∈ {128…4096}, both anchoring modes |
+| `--cot-frac` | 0.27 | Fraction of samples marked as slow-thinking |
+
+### Outputs
+
+| File | Contents |
+|---|---|
+| `outputs/artifacts/action_codebook.npz` | The 2048 `(Δx, Δy, Δθ)` tokens + metadata |
+| `outputs/artifacts/action_vocab.json` | The 2048 special tokens for the VLM tokenizer |
+| `outputs/artifacts/sft_train.jsonl` | 24,000 training chat records (~41 MB) |
+| `outputs/artifacts/unified_samples.jsonl` | The unified samples before tokenization |
+| `outputs/artifacts/ablation.json` | Codebook-size sweep results |
+| `outputs/artifacts/summary.json` | Every headline number, machine-readable |
+| `outputs/artifacts/report.txt` | The same, human-readable |
+| `outputs/figures/*.png` | Eight figures |
+
+### The figures
+
+| Figure | What it shows |
+|---|---|
+| `00_pipeline_overview` | Block diagram with live counts at each stage |
+| `01_action_codebook` | The 2048 tokens as endpoints, footprint contours, and speed coverage |
+| `02_kinematic_feasibility` | Curvature vs speed against vehicle limits; steering histogram |
+| `03_trajectory_reconstruction` | Ground truth vs decoded on eight manoeuvre types |
+| `04_codebook_size_ablation` | Error vs K, ours vs the paper, anchored vs open-loop |
+| `05_token_usage` | Heavy-tailed usage; 90% of usage from ~520 tokens |
+| `06_dataset_statistics` | Speed, curvature, acceleration, command mix, endpoint density, fast/slow split |
+| `07_sample_card` | One sample end to end: BEV plot beside the exact chat record |
+| `08_camera_overlay` | Trajectory projected onto `CAM_FRONT` *(nuScenes only)* |
+
+---
+
+## 8. Code layout
+
+```
+autovla/
+  config.py         Every constant, each traced to a line in the paper
+  geometry.py       SE(2) compose/relative, wrap, vehicle footprint contours
+  kinematics.py     Bicycle rollout, segment inversion, feasibility report
+  codebook.py       K-disk clustering (fps + threshold)
+  tokenizer.py      encode / decode / reconstruction metrics / vocabulary
+  schema.py         DrivingSample, Reasoning, command inference, JSONL I/O
+  prompts.py        System prompt, user message, fast/slow response format
+  build_dataset.py  Unified samples → SFT chat records
+  stats.py          Segment bank, sliding windows, corpus statistics
+  viz.py            All figures
+  adapters/
+    synthetic.py    Procedural bicycle-model corpus
+    nuscenes.py     Direct JSON reader + camera projection
+scripts/
+  run_pipeline.py       End-to-end driver
+  download_nuscenes.sh  Extract nuScenes mini
+  download_bddx.sh      Fetch BDD-X annotations
+```
+
+Verification built into the modules: SE(2) round-trip is exact to floating-point
+precision; the bicycle inversion recovers a known 0.2 rad steering input to four
+decimals; camera projection places straight-ahead points exactly on the principal
+point.
+
+---
+
+## 9. Honest limitations
+
+1. **The corpus is synthetic.** Stated throughout. Every downstream stage is
+   dataset-agnostic, so switching to nuScenes changes only Stage 1 — but the
+   *numbers* will change, and should be re-reported.
+2. **Codebook usage is 58.2%, not the paper's 100%.** Farthest-point sampling
+   spends tokens on the extremes of a corpus whose parameters are sampled
+   continuously. Denser real data, or `--mode threshold`, raises this.
+3. **Chain-of-thought text is a placeholder.** The fast/slow *mechanism* is real
+   and exercised; the reasoning *content* arrives in Milestone 5.
+4. **No perception yet.** This phase processes ego trajectories and image
+   *paths*. No image is currently fed through a network — that begins in
+   Milestone 4.
+5. **Contour distance is RMS, not arithmetic mean** (measured deviation: 0.2%
+   median, 16% worst case). A deliberate trade for vectorised clustering.
+
+---
+
+## 10. Parameters, and where each comes from
+
+| Parameter | Value | Source |
+|---|---|---|
+| Action token duration | 0.5 s | Paper §3.1 |
+| Planning horizon | 5 s → 10 tokens | Paper Appendix A |
+| Codebook size K | 2048 | Paper §3.1, Table 4 |
+| K-disk threshold δ | 0.05 m contour distance | Paper Appendix A |
+| Camera views | front-left, front, front-right | Paper §3.1 |
+| Frames per view | 4 at 2 Hz (2 s history) | Paper §3.1 |
+| Data rate | 2 Hz | Paper Appendix E.1 |
+| Ego footprint | 4.084 × 1.730 m | nuScenes ego platform |
+| Wheelbase | 2.588 m | nuScenes ego platform |
+| Contour points | 16 | Our choice (paper does not specify) |
+| Max curvature / steering | 0.2 m⁻¹ / 35° | Standard passenger-vehicle limits |
+| Backbone (Milestone 4) | Qwen2.5-VL-3B | Paper §3.1 |
+| LoRA rank / alpha / dropout | 8 / 8 / 0.1 | Paper Appendix D.3 |
+| GRPO reward | `r_Driving − 0.3·r_CoT` | Paper Appendix D.2 |
+| CoT length penalty | `1/(1+e^{−(L−400)·0.002})` | Paper Eq. S5 |
+
+---
+
+## 11. What comes next
+
+Milestone 4 loads Qwen2.5-VL-3B, extends its tokenizer with
+`action_vocab.json`, attaches LoRA, and runs one record from `sft_train.jsonl`
+through a forward pass. Everything in this document exists to make that step
+mechanical. See [MILESTONES.md](../MILESTONES.md).
