@@ -82,6 +82,12 @@ second scheme — so this is almost certainly what AutoVLA does, and it is worth
 knowing because the naive reading of that sentence costs a 6× accuracy loss.
 Both are implemented: `encode(traj, mode="anchored" | "open_loop")`.
 
+## Notebook walkthrough
+
+[`notebooks/01_dataset_walkthrough.ipynb`](notebooks/01_dataset_walkthrough.ipynb) explains
+the dataset end to end: the nuScenes table structure, every attribute of a processed
+sample, summary statistics and plots. Outputs are saved, so it reads without being run.
+
 ## Figures
 
 | File | What it shows |

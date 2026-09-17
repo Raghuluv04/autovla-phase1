@@ -6,6 +6,11 @@ pillow>=10.0
 tqdm>=4.66
 pyyaml>=6.0
 
+# Notebooks (docs/ walkthrough) — optional
+pandas>=2.0
+jupyter>=1.0
+nbformat>=5.9
+
 # Phase II (model training) — install when Milestone 4 starts
 # torch>=2.4
 # transformers>=4.49       # Qwen2.5-VL support

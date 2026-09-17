@@ -60,6 +60,7 @@ Achieved covering radius **0.063 m** against the paper's stated δ = 0.05 m, and
 | [data_pipeline/README.md](data_pipeline/README.md) | Pipeline overview, figures, key parameters |
 | [data_pipeline/docs/DATASET_AND_METHOD.md](data_pipeline/docs/DATASET_AND_METHOD.md) | Full dataset and method write-up, stage by stage |
 | [data_pipeline/MILESTONES.md](data_pipeline/MILESTONES.md) | Workflow through GRPO fine-tuning, with owners and risks |
+| [data_pipeline/notebooks/01_dataset_walkthrough.ipynb](data_pipeline/notebooks/01_dataset_walkthrough.ipynb) | Notebook: dataset attributes, preprocessing steps and plots, with outputs saved |
 
 ## Figures
 
