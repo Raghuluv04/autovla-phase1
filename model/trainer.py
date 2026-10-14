@@ -122,6 +122,12 @@ class SFTTrainer:
         self.dataset = SFTDataset(train_examples)
         self.collate = SFTCollator(bb.tokenizer, bb.processor, cfg.max_length, cfg.lambda_cot)
         self.params = [p for p in bb.model.parameters() if p.requires_grad]
+        # fp16 (T4 has no bf16) needs loss scaling, and GradScaler only unscales fp32 params
+        self.scaler = None
+        if cfg.backbone.compute_dtype == "float16" and bb.device.type == "cuda":
+            for p in self.params:
+                p.data = p.data.float()
+            self.scaler = torch.amp.GradScaler("cuda")
         self.opt = torch.optim.AdamW(self.params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.history: list[dict] = []
         self.lm_norm_const = self._mean_lm_tokens() if cfg.lm_norm == "token" else None
@@ -161,7 +167,8 @@ class SFTTrainer:
         for epoch in range(cfg.epochs):
             for batch in self._loader(epoch):
                 loss, parts = self._micro_step(batch)
-                (loss / cfg.grad_accum).backward()
+                scaled = loss / cfg.grad_accum
+                (self.scaler.scale(scaled) if self.scaler else scaled).backward()
                 acc["loss"] += float(loss.detach()); acc["n"] += 1
                 for k in ("l_lm", "l_action", "action_acc"):
                     acc[k] += float(parts[k])
@@ -172,8 +179,14 @@ class SFTTrainer:
                     continue
                 for g in self.opt.param_groups:
                     g["lr"] = _lr_at(step, cfg, total_steps)
+                if self.scaler:
+                    self.scaler.unscale_(self.opt)
                 gnorm = torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm)
-                self.opt.step(); self.opt.zero_grad(set_to_none=True)
+                if self.scaler:
+                    self.scaler.step(self.opt); self.scaler.update()    # skips the step on inf/nan grads
+                else:
+                    self.opt.step()
+                self.opt.zero_grad(set_to_none=True)
                 rec = dict(step=step, lr=self.opt.param_groups[0]["lr"], grad_norm=float(gnorm),
                            fast=acc["fast"], slow=acc["slow"], elapsed_s=time.time() - t0,
                            **{k: acc[k] / acc["n"] for k in ("loss", "l_lm", "l_action", "action_acc")})
@@ -252,6 +265,7 @@ def main():
     ap.add_argument("--steps", type=int, default=None, help="override optimizer steps")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--n-eval", type=int, default=None, help="held-out records to generate from after training")
     ap.add_argument("--holdout", type=int, default=None, help="records held out of SFT")
     ap.add_argument("--out-dir", default=None, help="checkpoint directory (default checkpoints/sft_standin)")
     ap.add_argument("--standin-hidden", type=int, default=64)
@@ -269,6 +283,8 @@ def main():
         cfg.lr = args.lr
     if args.holdout:
         cfg.holdout = args.holdout
+    if args.n_eval is not None:
+        cfg.n_eval = args.n_eval
     if args.standin:
         from .runtime import make_backbone, write_meta
 

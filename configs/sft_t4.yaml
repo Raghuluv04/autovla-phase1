@@ -1,0 +1,45 @@
+# Milestone 6 on a Kaggle T4 (16 GB, no bf16, ~2x slower than the A100 the paper used).
+# Same as sft.yaml except: float16 compute (loss-scaled in the trainer), a capped step budget,
+# and the checkpoint lands under /kaggle/working so it is kept as notebook output.
+model:
+  model_id: Qwen/Qwen2.5-VL-3B-Instruct
+  load_in_4bit: true
+  compute_dtype: float16
+  gradient_checkpointing: true
+  max_pixels: 200704
+
+lora:
+  rank: 8
+  alpha: 8
+  dropout: 0.1
+
+data:
+  sft_jsonl: data_pipeline/outputs/artifacts/sft_train.jsonl
+  cot_jsonl: outputs/phase2/cot_annotations.jsonl
+  holdout: 200
+  fast_per_slow: 3
+  max_length: 2048
+  limit: null
+
+loss:
+  lambda_action: 2.0
+  lambda_cot: 0.5
+  lm_norm: token
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 0.0
+  warmup_steps: 20
+  max_grad_norm: 1.0
+
+train:
+  epochs: 1
+  batch_size: 1
+  grad_accum: 8
+  max_steps: 300            # 300 x 8 = 2,400 records (~10% of an epoch); raise once s/step is known
+  seed: 0
+  log_every: 5
+  out_dir: checkpoints/sft_t4
+
+eval:
+  n_samples: 20
