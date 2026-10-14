@@ -42,7 +42,8 @@ class SFTConfig:
     batch_size: int = 1
     grad_accum: int = SFT_GRAD_ACCUM
     max_steps: int | None = None
-    seed: int = 0
+    seed: int = 0                      # fixes the held-out split: never change it between runs
+    order_seed: int | None = None      # record order; None = seed. A resumed run needs a different one
     log_every: int = 10
     save_every: int = 50               # write adapter.pt every N optimizer steps (0 = only at the end)
     out_dir: str = str(CHECKPOINT_DIR / "sft")
@@ -75,7 +76,7 @@ class SFTConfig:
             warmup_steps=op.get("warmup_steps", 20), max_grad_norm=op.get("max_grad_norm", 1.0),
             epochs=tr.get("epochs", 1), batch_size=tr.get("batch_size", 1),
             grad_accum=tr.get("grad_accum", SFT_GRAD_ACCUM), max_steps=tr.get("max_steps"),
-            seed=tr.get("seed", 0), log_every=tr.get("log_every", 10),
+            seed=tr.get("seed", 0), order_seed=tr.get("order_seed"), log_every=tr.get("log_every", 10),
             save_every=tr.get("save_every", 50),
             out_dir=rel(tr.get("out_dir", "checkpoints/sft")),
             lambda_action=ls.get("lambda_action", LAMBDA_ACTION), lambda_cot=ls.get("lambda_cot", LAMBDA_COT),
@@ -132,6 +133,7 @@ class SFTTrainer:
             self.scaler = torch.amp.GradScaler("cuda")
         self.opt = torch.optim.AdamW(self.params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.history: list[dict] = []
+        self.prior_history: list[dict] = []        # earlier runs this one resumed from
         self.save_every = cfg.save_every
         self.lm_norm_const = self._mean_lm_tokens() if cfg.lm_norm == "token" else None
 
@@ -143,7 +145,8 @@ class SFTTrainer:
         return float(sum(counts) / len(counts))
 
     def _loader(self, epoch):
-        sampler = MixedModeSampler(self.dataset.modes(), self.cfg.fast_per_slow, self.cfg.seed)
+        order = self.cfg.seed if self.cfg.order_seed is None else self.cfg.order_seed
+        sampler = MixedModeSampler(self.dataset.modes(), self.cfg.fast_per_slow, order)
         sampler.set_epoch(epoch)
         return DataLoader(self.dataset, batch_size=self.cfg.batch_size, sampler=sampler,
                           collate_fn=self.collate)
@@ -210,7 +213,7 @@ class SFTTrainer:
     def save(self, name="adapter.pt"):
         path = Path(self.cfg.out_dir) / name
         save_trainable(self.bb.model, path)
-        (Path(self.cfg.out_dir) / "history.json").write_text(json.dumps(self.history))
+        (Path(self.cfg.out_dir) / "history.json").write_text(json.dumps(self.prior_history + self.history))
         return path
 
 
@@ -244,7 +247,7 @@ def evaluate_holdout(bb: Backbone, examples: list[SFTExample], n: int = 20) -> d
                 token_acc=avg("token_acc"), rows=rows)
 
 
-def run_sft(bb: Backbone, cfg: SFTConfig, examples=None) -> dict:
+def run_sft(bb: Backbone, cfg: SFTConfig, examples=None, prior_history=None) -> dict:
     """Train + evaluate; returns a summary dict."""
     if examples is None:
         from .cot_annotator import read_annotations
@@ -256,6 +259,7 @@ def run_sft(bb: Backbone, cfg: SFTConfig, examples=None) -> dict:
     train, held = split_holdout(examples, cfg.holdout, cfg.seed,
                                 held_ids=holdout_ids(cfg.sft_jsonl, cfg.holdout, cfg.seed))
     trainer = SFTTrainer(bb, train, cfg)
+    trainer.prior_history = prior_history or []
     hist = trainer.train()
     path = trainer.save()
     first, last = loss_trend(hist)
@@ -271,6 +275,10 @@ def main():
     ap.add_argument("--steps", type=int, default=None, help="override optimizer steps")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--resume", default=None, help="adapter.pt from an earlier run to continue from")
+    ap.add_argument("--order-seed", type=int, default=None,
+                    help="record-order seed (default: seed+1 when resuming, so records are reshuffled; "
+                         "the held-out split always uses the config seed)")
     ap.add_argument("--n-eval", type=int, default=None, help="held-out records to generate from after training")
     ap.add_argument("--holdout", type=int, default=None, help="records held out of SFT")
     ap.add_argument("--out-dir", default=None, help="checkpoint directory (default checkpoints/sft_standin)")
@@ -291,12 +299,18 @@ def main():
         cfg.holdout = args.holdout
     if args.n_eval is not None:
         cfg.n_eval = args.n_eval
+    if args.resume:
+        cfg.order_seed = args.order_seed if args.order_seed is not None else cfg.seed + 1
+        if not args.out_dir:               # never overwrite the adapter being resumed from
+            cfg.out_dir = str(Path(args.resume).resolve().parent) + "_resumed"
+    elif args.order_seed is not None:
+        cfg.order_seed = args.order_seed
     if args.standin:
         from .runtime import make_backbone, write_meta
 
         if args.lora_rank:
             cfg.backbone.lora.rank = cfg.backbone.lora.alpha = args.lora_rank
-        cfg.out_dir = args.out_dir or str(CHECKPOINT_DIR / "sft_standin")
+        cfg.out_dir = args.out_dir or (cfg.out_dir if args.resume else str(CHECKPOINT_DIR / "sft_standin"))
         spec = dict(standin=True, hidden=args.standin_hidden, layers=args.standin_layers,
                     lora_rank=cfg.backbone.lora.rank)
         bb = make_backbone(spec=spec, cfg=cfg.backbone)
@@ -305,7 +319,16 @@ def main():
         if args.out_dir:
             cfg.out_dir = args.out_dir
         bb = load_model(cfg.backbone)
-    res = run_sft(bb, cfg)
+    prior = []
+    if args.resume:
+        from .backbone import load_trainable
+
+        n = load_trainable(bb.model, args.resume)
+        hp = Path(args.resume).parent / "history.json"
+        prior = json.loads(hp.read_text()) if hp.exists() else []
+        print(f"resumed {n} trainable tensors from {args.resume} ({len(prior)} earlier steps); "
+              f"order_seed={cfg.order_seed}, writing to {cfg.out_dir}")
+    res = run_sft(bb, cfg, prior_history=prior)
     ev = res["holdout"]
     print(f"loss: first quarter {res['first_quarter_loss']:.4f} -> last quarter {res['last_quarter_loss']:.4f}")
     print(f"held-out ({ev['n']}): valid(constrained) {ev['valid_constrained']:.0%}, "

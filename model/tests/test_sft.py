@@ -124,3 +124,34 @@ def test_token_level_lm_norm_restores_opener_weight():
     g_tok = logits.grad[:, 1].abs().sum(-1)
     assert g_mean[0] / g_mean[1] == pytest.approx(36 / 8, rel=1e-3)      # per-sample: short record dominates
     assert g_tok[0] / g_tok[1] == pytest.approx(1.0, rel=1e-3)           # token-level: equal per token
+
+
+def test_resume_restores_weights_reshuffles_order_and_keeps_holdout(tmp_path, tiny):
+    from model.backbone import load_trainable, save_trainable, trainable_state_dict
+    from model.dataset import holdout_ids
+
+    ex = make_examples(16)
+    cfg = SFTConfig(lr=3e-3, warmup_steps=2, grad_accum=2, max_steps=4, log_every=1000,
+                    out_dir=str(tmp_path / "a"), backbone=BackboneConfig(load_in_4bit=False))
+    tr = SFTTrainer(tiny, ex, cfg)
+    tr.train()
+    path = tr.save()
+    saved = {k: v.clone() for k, v in trainable_state_dict(tiny.model).items()}
+
+    with torch.no_grad():                                           # perturb, then restore from the file
+        for p in tiny.model.parameters():
+            if p.requires_grad:
+                p.add_(1.0)
+    assert load_trainable(tiny.model, path) == len(saved)
+    assert all(torch.equal(v, saved[k]) for k, v in trainable_state_dict(tiny.model).items())
+
+    first = lambda order: [i for _, i in zip(range(8), iter(SFTTrainer(tiny, ex, SFTConfig(
+        order_seed=order, backbone=BackboneConfig(load_in_4bit=False)))._loader(0).sampler))]
+    assert first(0) != first(1) and first(1) == first(1)            # new seed -> new order, deterministic
+    # the held-out split depends on `seed` only, so a resumed run never trains on evaluation records
+    assert holdout_ids(SFT_JSONL, 20, seed=0) == holdout_ids(SFT_JSONL, 20, seed=0)
+
+    tr.prior_history = [dict(step=0)]
+    tr.save()
+    import json
+    assert len(json.loads((tmp_path / "a" / "history.json").read_text())) == len(tr.history) + 1

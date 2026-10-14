@@ -6,7 +6,8 @@ import pytest
 from autovla.schema import DrivingSample
 from model.backbone import load_model
 from model.config import BackboneConfig
-from model.evaluate import build_eval_items, evaluate_modes, format_table, resolve_mode
+from model.evaluate import (BASELINES, baseline_trajectory, build_eval_items, evaluate_modes, format_table,
+                            resolve_mode)
 from model.metrics import (LatencyMeter, OpenLoopAccumulator, box_corners, collision_by_horizon,
                            l2_at_horizons, l2_cumulative, latency_reduction, obb_overlap,
                            route_completion)
@@ -112,3 +113,16 @@ def test_evaluate_modes_end_to_end_on_standin():
     assert {r["mode"] for r in res["random"]["rows"]} <= {"fast", "slow"}
     assert "L2@3s" in format_table(res)
     assert resolve_mode("fast", np.random.default_rng(0)) == "fast"
+
+
+def test_baselines_need_no_model_and_const_vel_is_exact_on_straight_driving():
+    s = sample(4.0, straight(v=4.0), "b")
+    assert np.allclose(baseline_trajectory("const_vel", s), straight(v=4.0))
+    assert not baseline_trajectory("stand_still", s).any()
+    items = build_eval_items(n=6)
+    res = evaluate_modes(None, items, modes=BASELINES)                    # bb=None: nothing is loaded
+    for m in BASELINES:
+        a = res[m]["summary"]["all"]
+        assert a["n"] == 6 and a["latency_s"] == 0 and a["cot_tokens"] == 0
+    assert res["const_vel"]["summary"]["all"]["ADE"] < res["stand_still"]["summary"]["all"]["ADE"]
+    assert "const_vel" in format_table(res)

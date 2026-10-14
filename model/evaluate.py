@@ -29,13 +29,15 @@ from autovla.schema import DrivingSample, read_samples
 from autovla.tokenizer import ActionTokenizer
 
 from .backbone import Backbone
-from .config import (CODEBOOK_NPZ, RESULTS_DIR, SFT_JSONL, UNIFIED_JSONL, EVAL_HORIZONS_S)
+from .config import (CODEBOOK_NPZ, DT, RESULTS_DIR, SFT_JSONL, UNIFIED_JSONL, EVAL_HORIZONS_S)
 from .dataset import holdout_ids
 from .inference import generate_plan
 from .metrics import OpenLoopAccumulator, latency_reduction
 from .splits import is_hard, synthetic_obstacles
 
 MODES = ("fast", "slow", "random", "auto")
+# Model-free reference rows. A learned planner has to beat ``const_vel`` before its numbers mean anything.
+BASELINES = ("const_vel", "stand_still")
 
 
 @dataclass
@@ -62,13 +64,23 @@ def build_eval_items(n: int | None = None, holdout: int = 200, seed: int = 0,
     return items[:n] if n else items
 
 
+def baseline_trajectory(mode: str, sample: DrivingSample) -> np.ndarray:
+    """Ego-frame ``(T+1, 3)`` path of a model-free baseline.
+
+    ``const_vel`` drives straight at the current speed; ``stand_still`` never moves.
+    """
+    n = len(sample.future_traj)
+    x = np.arange(n) * DT * (float(sample.velocity) if mode == "const_vel" else 0.0)
+    return np.stack([x, np.zeros(n), np.zeros(n)], 1)
+
+
 def resolve_mode(mode: str, rng: np.random.Generator) -> str:
     if mode == "random":
         return "fast" if rng.random() < 0.5 else "slow"
     return mode
 
 
-def run_mode(bb: Backbone, items: list[EvalItem], mode: str, tok: ActionTokenizer,
+def run_mode(bb: Backbone | None, items: list[EvalItem], mode: str, tok: ActionTokenizer,
              seed: int = 0, cot_max_tokens: int | None = None) -> tuple[dict, list[dict]]:
     """Evaluate one mode on all items -> ({split: summary}, per-item rows)."""
     rng = np.random.default_rng(seed)
@@ -78,20 +90,24 @@ def run_mode(bb: Backbone, items: list[EvalItem], mode: str, tok: ActionTokenize
     for i, it in enumerate(items):
         if i and i % 10 == 0:
             print(f"  [{mode}] {i}/{len(items)} scenes", flush=True)
-        used = resolve_mode(mode, rng)
-        plan = generate_plan(bb, it.messages, mode=used, **kw)
-        pred = tok.decode(plan.action_ids)
         gt = np.asarray(it.sample.future_traj, float)
+        if mode in BASELINES:
+            pred, used, latency, n_cot, action_ids = baseline_trajectory(mode, it.sample), mode, 0.0, 0, []
+        else:
+            used = resolve_mode(mode, rng)
+            plan = generate_plan(bb, it.messages, mode=used, **kw)
+            pred, used, latency, n_cot, action_ids = (tok.decode(plan.action_ids), plan.mode,
+                                                      plan.latency_s, plan.n_cot_tokens, plan.action_ids)
         for key in ("all", "hard" if it.hard else "easy"):
-            accs[key].add(pred, gt, it.obstacles, plan.latency_s, plan.n_cot_tokens)
-        rows.append(dict(id=it.sample.sample_id, hard=it.hard, mode=plan.mode,
-                         latency_s=plan.latency_s, cot_tokens=plan.n_cot_tokens,
+            accs[key].add(pred, gt, it.obstacles, latency, n_cot)
+        rows.append(dict(id=it.sample.sample_id, hard=it.hard, mode=used,
+                         latency_s=latency, cot_tokens=n_cot,
                          ade=float(np.linalg.norm(pred[1:, :2] - gt[1:, :2], axis=1).mean()),
-                         action_ids=plan.action_ids))
+                         action_ids=action_ids))
     return {k: a.summary() for k, a in accs.items()}, rows
 
 
-def evaluate_modes(bb: Backbone, items: list[EvalItem], modes=MODES, seed: int = 0, **kw) -> dict:
+def evaluate_modes(bb: Backbone | None, items: list[EvalItem], modes=MODES, seed: int = 0, **kw) -> dict:
     tok = ActionTokenizer(Codebook.load(CODEBOOK_NPZ))
     out = {}
     for m in modes:
@@ -149,7 +165,9 @@ def main():
     ap.add_argument("--standin", action="store_true")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--n", type=int, default=100)
-    ap.add_argument("--modes", nargs="+", default=list(MODES))
+    ap.add_argument("--modes", nargs="+", default=list(MODES) + ["const_vel"],
+                    choices=list(MODES) + list(BASELINES),
+                    help="model modes plus model-free baselines (a baselines-only run loads no model)")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--cot-max-tokens", type=int, default=None)
     ap.add_argument("--compute-dtype", default=None,
@@ -158,12 +176,13 @@ def main():
     cfg = BackboneConfig()
     if args.compute_dtype:
         cfg.compute_dtype = args.compute_dtype
-    bb = make_backbone(args.standin, cfg, args.checkpoint)
+    bb = None if set(args.modes) <= set(BASELINES) else make_backbone(args.standin, cfg, args.checkpoint)
     items = build_eval_items(args.n)
     import torch
 
     # inference.py has no autocast of its own; match the training-time mixed precision on CUDA
-    with torch.autocast(bb.device.type, dtype=getattr(torch, cfg.compute_dtype), enabled=bb.device.type == "cuda"):
+    on_cuda = bb is not None and bb.device.type == "cuda"
+    with torch.autocast("cuda", dtype=getattr(torch, cfg.compute_dtype), enabled=on_cuda):
         res = evaluate_modes(bb, items, args.modes, cot_max_tokens=args.cot_max_tokens)
     for split in ("all", "easy", "hard"):
         print(f"\n[{split}]\n" + format_table(res, split))
