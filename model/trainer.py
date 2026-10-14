@@ -44,6 +44,7 @@ class SFTConfig:
     max_steps: int | None = None
     seed: int = 0
     log_every: int = 10
+    save_every: int = 50               # write adapter.pt every N optimizer steps (0 = only at the end)
     out_dir: str = str(CHECKPOINT_DIR / "sft")
     lambda_action: float = LAMBDA_ACTION
     lambda_cot: float = LAMBDA_COT
@@ -75,6 +76,7 @@ class SFTConfig:
             epochs=tr.get("epochs", 1), batch_size=tr.get("batch_size", 1),
             grad_accum=tr.get("grad_accum", SFT_GRAD_ACCUM), max_steps=tr.get("max_steps"),
             seed=tr.get("seed", 0), log_every=tr.get("log_every", 10),
+            save_every=tr.get("save_every", 50),
             out_dir=rel(tr.get("out_dir", "checkpoints/sft")),
             lambda_action=ls.get("lambda_action", LAMBDA_ACTION), lambda_cot=ls.get("lambda_cot", LAMBDA_COT),
             lm_norm=ls.get("lm_norm", "token"),
@@ -130,6 +132,7 @@ class SFTTrainer:
             self.scaler = torch.amp.GradScaler("cuda")
         self.opt = torch.optim.AdamW(self.params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.history: list[dict] = []
+        self.save_every = cfg.save_every
         self.lm_norm_const = self._mean_lm_tokens() if cfg.lm_norm == "token" else None
 
     def _mean_lm_tokens(self, n: int = 256) -> float:
@@ -194,9 +197,12 @@ class SFTTrainer:
                 if step % cfg.log_every == 0:
                     print(f"step {step:5d}/{total_steps} loss {rec['loss']:.4f} "
                           f"(lm {rec['l_lm']:.3f}, action {rec['l_action']:.3f}, "
-                          f"act-acc {rec['action_acc']:.2f}) lr {rec['lr']:.2e}")
+                          f"act-acc {rec['action_acc']:.2f}) lr {rec['lr']:.2e} "
+                          f"{rec['elapsed_s'] / (step + 1):.1f}s/step", flush=True)
                 acc = dict(loss=0.0, l_lm=0.0, l_action=0.0, action_acc=0.0, n=0, fast=0, slow=0)
                 step += 1
+                if self.save_every and step % self.save_every == 0:
+                    self.save()                      # resumable-by-eye insurance against session loss
                 if step >= total_steps:
                     return self.history
         return self.history
@@ -296,6 +302,8 @@ def main():
         bb = make_backbone(spec=spec, cfg=cfg.backbone)
         write_meta(cfg.out_dir, spec)
     else:
+        if args.out_dir:
+            cfg.out_dir = args.out_dir
         bb = load_model(cfg.backbone)
     res = run_sft(bb, cfg)
     ev = res["holdout"]
