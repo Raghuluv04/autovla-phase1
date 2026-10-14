@@ -1,0 +1,44 @@
+# Milestone 6: supervised fine-tuning of Qwen2.5-VL-3B + LoRA with dual thinking modes.
+# Sections map 1:1 onto model.trainer.SFTConfig. Paper constants are cited in model/config.py.
+model:
+  model_id: Qwen/Qwen2.5-VL-3B-Instruct
+  load_in_4bit: true            # bitsandbytes NF4; needs CUDA (T4 / A100)
+  compute_dtype: bfloat16       # use float16 on a T4 (no bf16)
+  gradient_checkpointing: true
+  max_pixels: 200704            # 448x448: bounds visual tokens per image
+
+lora:
+  rank: 8
+  alpha: 8
+  dropout: 0.1
+
+data:
+  sft_jsonl: data_pipeline/outputs/artifacts/sft_train.jsonl
+  cot_jsonl: outputs/phase2/cot_annotations.jsonl   # from `python -m model.cot_annotator`
+  holdout: 200                  # held out by id hash; first `eval.n_samples` are generated from
+  fast_per_slow: 3              # fast:slow = 3:1 within every block of 4
+  max_length: 2048
+  limit: null                   # cap records (debugging)
+
+loss:                           # L = w * (L_LM + lambda_action * L_action)
+  lambda_action: 2.0
+  lambda_cot: 0.5               # w for slow-thinking records; w = 1 for fast
+  lm_norm: token                # token-level mean for L_LM (see trainer.sft_loss); 'sample' = per-sample mean
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 0.0
+  warmup_steps: 20
+  max_grad_norm: 1.0
+
+train:
+  epochs: 1
+  batch_size: 1
+  grad_accum: 8
+  max_steps: null               # optimizer steps; null = full epoch
+  seed: 0
+  log_every: 10
+  out_dir: checkpoints/sft
+
+eval:
+  n_samples: 20
