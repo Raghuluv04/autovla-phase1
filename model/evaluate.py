@@ -75,7 +75,9 @@ def run_mode(bb: Backbone, items: list[EvalItem], mode: str, tok: ActionTokenize
     accs = {"all": OpenLoopAccumulator(), "easy": OpenLoopAccumulator(), "hard": OpenLoopAccumulator()}
     rows = []
     kw = {} if cot_max_tokens is None else dict(cot_max_tokens=cot_max_tokens)
-    for it in items:
+    for i, it in enumerate(items):
+        if i and i % 10 == 0:
+            print(f"  [{mode}] {i}/{len(items)} scenes", flush=True)
         used = resolve_mode(mode, rng)
         plan = generate_plan(bb, it.messages, mode=used, **kw)
         pred = tok.decode(plan.action_ids)
@@ -150,10 +152,19 @@ def main():
     ap.add_argument("--modes", nargs="+", default=list(MODES))
     ap.add_argument("--tag", default=None)
     ap.add_argument("--cot-max-tokens", type=int, default=None)
+    ap.add_argument("--compute-dtype", default=None,
+                    help="float16 on a T4 (no bf16); match what the checkpoint was trained with")
     args = ap.parse_args()
-    bb = make_backbone(args.standin, BackboneConfig(), args.checkpoint)
+    cfg = BackboneConfig()
+    if args.compute_dtype:
+        cfg.compute_dtype = args.compute_dtype
+    bb = make_backbone(args.standin, cfg, args.checkpoint)
     items = build_eval_items(args.n)
-    res = evaluate_modes(bb, items, args.modes, cot_max_tokens=args.cot_max_tokens)
+    import torch
+
+    # inference.py has no autocast of its own; match the training-time mixed precision on CUDA
+    with torch.autocast(bb.device.type, dtype=getattr(torch, cfg.compute_dtype), enabled=bb.device.type == "cuda"):
+        res = evaluate_modes(bb, items, args.modes, cot_max_tokens=args.cot_max_tokens)
     for split in ("all", "easy", "hard"):
         print(f"\n[{split}]\n" + format_table(res, split))
     print("\nlatency reduction fast vs slow:", {k: f"{v:.1%}" for k, v in res.get("latency_reduction", {}).items()})
