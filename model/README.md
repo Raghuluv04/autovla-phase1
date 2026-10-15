@@ -12,11 +12,11 @@ This code was written and tested on a MacBook with **no CUDA GPU**, and the Phas
 | Piece | Status |
 |---|---|
 | Every module's logic (tokenizer extension, LoRA-only invariant, Eq. 2 loss, 3:1 mixing, constrained decoding, metrics, uncertainty, gate, GRPO, reward) | Unit-tested on CPU in `model/tests/` against a tiny random-weight **real `Qwen2_5_VLForConditionalGeneration`** (`model/standin.py`) |
-| Loading `Qwen/Qwen2.5-VL-3B-Instruct`, NF4 4-bit via bitsandbytes, gradient checkpointing on CUDA | Written, **never executed** (no GPU, ~7 GB weights not downloaded). `load_base` is only checked against mocks |
+| Loading `Qwen/Qwen2.5-VL-3B-Instruct`, NF4 4-bit via bitsandbytes, gradient checkpointing, SFT, open-loop evaluation | **Run on a Kaggle T4** (fp16 + loss scaling): smoke test, 1200-step SFT, evaluation. Results below. GRPO and the uncertainty/gating stages have still only run on the stand-in |
 | Anything with images (vision features for the uncertainty head, `PromptEncoder` with a processor) | Vision *forward* path tested on the stand-in with random pixel tensors; real image loading untested |
 | DriveLM-based CoT | Reformatter implemented and tested on a hand-written fixture in DriveLM's layout; **no DriveLM data was available**, so all CoT in `outputs/phase2/cot_annotations.jsonl` is trajectory-derived text (no perception content) |
 | BDD-X benchmark (BLEU-4/METEOR/CIDEr) | Metrics verified against sacreBLEU / pycocoevalcap (BLEU, CIDEr to 1e-9); **BDD-X was not run** (CSV not downloaded: `data_pipeline/scripts/download_bddx.sh`). METEOR is exact+stem only |
-| Numbers in `results/` | Produced by the **stand-in model on synthetic data with synthetic agent boxes**. They show the pipeline works end to end. They are *not* results for Qwen2.5-VL-3B or nuScenes, and the CSV says so in its `provenance` column |
+| Numbers in `results/` | Except `openloop_sft_t4_1200.csv` (real model, below), produced by the **stand-in model on synthetic data with synthetic agent boxes**. They show the pipeline works end to end. They are *not* results for Qwen2.5-VL-3B or nuScenes, and the CSV says so in its `provenance` column |
 
 ## Layout
 
@@ -81,6 +81,26 @@ Add `--standin` to any of them to use the tiny CPU model (`trainer`, `evaluate`,
 * **Stand-in rescaling.** The stand-in's tokenizer yields far more tokens per sentence than Qwen's, so
   stand-in GRPO runs rescale `L_tol`/γ/`cot_max_tokens` and `τ_fail` (the stand-in's ADE is metres, not
   decimetres). Real runs use the paper constants in `config.py`.
+
+## Real-model result: Qwen2.5-VL-3B + LoRA, Kaggle T4, synthetic corpus
+
+`model/run_kaggle.sh` (SFT 1200 optimizer steps at ~9.5 s/step, fp16, `configs/sft_t4.yaml`), then
+`model.evaluate` on 40 of the 200 held-out scenes. Synthetic corpus, no images, trajectory-templated CoT,
+synthetic agent boxes. These are not nuScenes numbers. Full table: `results/openloop_sft_t4_1200.csv`.
+
+| mode (all, n=40) | L2@1s | L2@3s | ADE | Col@3s | latency |
+|---|---|---|---|---|---|
+| fast | 0.46 | 4.01 | 4.13 | 0.050 | 2.0 s |
+| slow | 0.47 | 4.13 | 4.23 | 0.050 | 27.9 s |
+| random | 0.46 | 3.97 | 4.07 | 0.050 | 17.4 s |
+| auto | 0.46 | 4.01 | 4.13 | 0.050 | 2.5 s |
+| const_vel (baseline) | 0.69 | 6.10 | 6.11 | 0.100 | 0 |
+
+* The model beats constant velocity on every split (ADE easy 1.00 vs 2.48, hard 7.94 vs 10.54). An earlier
+  300-step adapter did not (ADE 8.29): at that point it was worse than a straight line.
+* `slow` is no more accurate than `fast` and ~14x slower, as expected without images or informative CoT.
+  `auto` never chose slow (identical to `fast`). With 40 scenes (18 hard), differences of ~0.1 m ADE between
+  modes are noise.
 
 ## Results so far (tiny stand-in, synthetic corpus, synthetic agents; reproduce with `model/run_standin_pipeline.sh`)
 
