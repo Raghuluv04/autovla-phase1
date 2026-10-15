@@ -155,3 +155,16 @@ def test_resume_restores_weights_reshuffles_order_and_keeps_holdout(tmp_path, ti
     tr.save()
     import json
     assert len(json.loads((tmp_path / "a" / "history.json").read_text())) == len(tr.history) + 1
+
+
+def test_consumed_ids_replays_exactly_what_the_trainer_draws(tiny):
+    from model.dataset import consumed_ids
+
+    ex = make_examples(16)
+    cfg = SFTConfig(grad_accum=2, order_seed=5, backbone=BackboneConfig(load_in_4bit=False))
+    drawn = [i for b in SFTTrainer(tiny, ex, cfg)._loader(0) for i in b["ids"]]
+    for steps in (1, 3):
+        assert consumed_ids(ex, steps, 2, order_seed=5) == set(drawn[:steps * 2])
+    assert consumed_ids(ex, 3, 2, order_seed=5) != consumed_ids(ex, 3, 2, order_seed=6)
+    with pytest.raises(ValueError):
+        consumed_ids(ex, 100, 2)                              # more records than one epoch holds

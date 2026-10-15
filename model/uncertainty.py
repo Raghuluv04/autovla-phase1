@@ -285,6 +285,7 @@ def collect_scene_outputs(bb: Backbone, items, codec, T: int = MC_DROPOUT_T, see
     epi_head = EpistemicHead(T) if T > 0 else None
     enc, gcfg = PromptEncoder(bb.tokenizer, bb.processor), GRPOConfig()
     ids, feats, sq, ade_, epi, hard, preds, t_feat, t_est, pconf = [], [], [], [], [], [], [], [], [], []
+    t_start = time.perf_counter()
     for n, it in enumerate(items):
         gt = np.asarray(it.sample.future_traj, float)
         pred = codec.decode(generate_plan(bb, it.messages, mode="fast").action_ids)   # dropout off
@@ -305,7 +306,9 @@ def collect_scene_outputs(bb: Backbone, items, codec, T: int = MC_DROPOUT_T, see
         sq.append(float((err ** 2).mean())); ade_.append(float(err.mean()))
         epi.append(res_sigma2); hard.append(it.hard); preds.append(pred)
         if progress and (n + 1) % progress == 0:
-            print(f"  collected {n + 1}/{len(items)}", flush=True)
+            el = time.perf_counter() - t_start
+            print(f"  collected {n + 1}/{len(items)}  ({el / (n + 1):.1f} s/scene, "
+                  f"~{el / (n + 1) * (len(items) - n - 1) / 60:.0f} min left)", flush=True)
     return SceneOutputs(ids, np.stack(feats), np.array(sq), np.array(ade_), np.array(epi),
                         np.array(hard), np.stack(preds), np.array(pconf), np.array(t_feat), np.array(t_est))
 
@@ -424,10 +427,19 @@ def main():
     ap.add_argument("--calibrator", default="auto", choices=["auto", "logit_T", "variance_T", "logit_T_bias"])
     ap.add_argument("--tag", default=None)
     ap.add_argument("--cache", default=None)
+    ap.add_argument("--compute-dtype", default=None, help="float16 on a T4 (no bf16)")
+    ap.add_argument("--unseen-sft-config", default=None,
+                    help="SFT yaml; draw scenes from records that run never saw (needs --sft-steps). "
+                         "Use when the hold-out is smaller than n-train+n-calib+n-test")
+    ap.add_argument("--sft-steps", type=int, default=None, help="optimizer steps of the (un-resumed) SFT run")
+    ap.add_argument("--progress", type=int, default=25)
     args = ap.parse_args()
 
     tag = args.tag or ("standin" if args.standin else "model")
-    bb = make_backbone(args.standin, BackboneConfig(), args.checkpoint)
+    bcfg = BackboneConfig()
+    if args.compute_dtype:
+        bcfg.compute_dtype = args.compute_dtype
+    bb = make_backbone(args.standin, bcfg, args.checkpoint)
     codec = load_action_codec()
     cache = Path(args.cache or PHASE2_DIR / f"unc_scenes_{tag}.npz")
     if cache.exists():
@@ -435,10 +447,22 @@ def main():
         print(f"loaded {len(allo)} cached scene outputs from {cache}")
     else:
         n_all = args.n_train + args.n_calib + args.n_test
-        items = build_eval_items(n_all, holdout=args.holdout, obstacles=None)
+        if args.unseen_sft_config:
+            from .trainer import SFTConfig, unseen_ids
+
+            if not args.sft_steps:
+                raise SystemExit("--unseen-sft-config needs --sft-steps")
+            pool = unseen_ids(SFTConfig.from_yaml(args.unseen_sft_config), args.sft_steps)
+            print(f"{len(pool)} records were never drawn by the {args.sft_steps}-step SFT run", flush=True)
+            items = build_eval_items(n_all, ids=pool, obstacles=None, shuffle_seed=0)
+        else:
+            items = build_eval_items(n_all, holdout=args.holdout, obstacles=None)
         if len(items) < n_all:
-            raise SystemExit(f"hold-out has {len(items)} scenes, need {n_all}; raise --holdout/retrain")
-        allo = collect_scene_outputs(bb, items, codec, args.T, progress=200)
+            raise SystemExit(f"only {len(items)} usable scenes, need {n_all}; lower --n-* or retrain with a larger hold-out")
+        import torch
+
+        with torch.autocast("cuda", dtype=getattr(torch, bcfg.compute_dtype), enabled=bb.device.type == "cuda"):
+            allo = collect_scene_outputs(bb, items, codec, args.T, progress=args.progress)
         allo.save(cache)
     idx = np.random.default_rng(0).permutation(len(allo))
     a, b = args.n_train, args.n_train + args.n_calib

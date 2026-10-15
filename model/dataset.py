@@ -148,6 +148,23 @@ class MixedModeSampler(Sampler):
             yield from block
 
 
+def consumed_ids(train: list[SFTExample], steps: int, grad_accum: int, batch_size: int = 1,
+                 fast_per_slow: int = 3, order_seed: int = 0, epoch: int = 0) -> set[str]:
+    """Ids of the records the first ``steps`` optimizer steps of an SFT run drew.
+
+    The sampler is a seeded shuffle, so a finished run's training set can be replayed
+    exactly. Everything *not* returned was never seen, which is what the uncertainty
+    head needs (it has to learn the policy's error on scenes it did not fit).
+    """
+    sampler = MixedModeSampler([e.mode for e in train], fast_per_slow, order_seed)
+    sampler.set_epoch(epoch)
+    n = steps * grad_accum * batch_size
+    order = list(sampler)
+    if n > len(order):
+        raise ValueError(f"{steps} steps need {n} records but one epoch only yields {len(order)}")
+    return {train[i].sample_id for i in order[:n]}
+
+
 class SFTCollator:
     """Encode examples into padded tensors with Eq.-2 masks and per-sample w."""
 

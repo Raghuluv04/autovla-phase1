@@ -49,8 +49,11 @@ class EvalItem:
 
 
 def build_eval_items(n: int | None = None, holdout: int = 200, seed: int = 0,
-                     sft_path=SFT_JSONL, unified_path=UNIFIED_JSONL, obstacles: str = "synthetic"):
-    held = set(holdout_ids(sft_path, holdout, seed))
+                     sft_path=SFT_JSONL, unified_path=UNIFIED_JSONL, obstacles: str = "synthetic",
+                     ids=None, shuffle_seed: int | None = None):
+    """Evaluation scenes: the hash-chosen hold-out, or any explicit ``ids`` (e.g. records an SFT
+    run never drew). ``shuffle_seed`` takes a random ``n`` of them instead of the first ``n``."""
+    held = set(ids) if ids is not None else set(holdout_ids(sft_path, holdout, seed))
     by_id = {s.sample_id: s for s in read_samples(unified_path) if s.sample_id in held}
     items = []
     with open(sft_path) as f:
@@ -61,6 +64,8 @@ def build_eval_items(n: int | None = None, holdout: int = 200, seed: int = 0,
                 continue
             obs = synthetic_obstacles(s, seed) if obstacles == "synthetic" else None
             items.append(EvalItem(s, rec["messages"][:2], obs, is_hard(s)))
+    if shuffle_seed is not None:
+        items = [items[i] for i in np.random.default_rng(shuffle_seed).permutation(len(items))]
     return items[:n] if n else items
 
 

@@ -247,6 +247,26 @@ def evaluate_holdout(bb: Backbone, examples: list[SFTExample], n: int = 20) -> d
                 token_acc=avg("token_acc"), rows=rows)
 
 
+def unseen_ids(cfg: SFTConfig, steps: int) -> set[str]:
+    """Ids never drawn by a single-epoch SFT run of ``steps`` optimizer steps with ``cfg``.
+
+    Includes the explicit hold-out. Valid only for a run that was not resumed, since a
+    resumed run reshuffles (``order_seed``) and so consumes a different set of records.
+    """
+    from .cot_annotator import read_annotations
+    from .dataset import consumed_ids
+
+    cot = read_annotations(cfg.cot_jsonl) if Path(cfg.cot_jsonl).exists() else None
+    examples, _ = load_examples(cfg.sft_jsonl, cot, cfg.limit)
+    train, _ = split_holdout(examples, cfg.holdout, cfg.seed,
+                             held_ids=holdout_ids(cfg.sft_jsonl, cfg.holdout, cfg.seed))
+    seen = consumed_ids(train, steps, cfg.grad_accum, cfg.batch_size, cfg.fast_per_slow,
+                        cfg.seed if cfg.order_seed is None else cfg.order_seed)
+    with open(cfg.sft_jsonl) as f:
+        every = [json.loads(line)["id"] for line in f]
+    return {i for i in every if i not in seen}
+
+
 def run_sft(bb: Backbone, cfg: SFTConfig, examples=None, prior_history=None) -> dict:
     """Train + evaluate; returns a summary dict."""
     if examples is None:
